@@ -248,6 +248,12 @@ fn convert_dump(conn: &Connection, dump_file: PathBuf, _args: &Args) -> Result<(
                 }
             }
 
+            // MySQL dumps escape single quotes with a backslash (e.g. O\'Reilly).
+            // SQLite expects them doubled instead. Convert these escapes before
+            // executing the statement so values containing quotes import
+            // correctly.
+            exec_stmt = exec_stmt.replace("\\'", "''");
+
             debug!("About to execute SQL:\n{}", exec_stmt);
             if let Err(e) = conn.execute_batch(&exec_stmt) {
                 error!("Error executing SQL: {}\nSQL was:\n{}", e, exec_stmt);
