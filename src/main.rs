@@ -113,20 +113,38 @@ fn should_skip_table(args: &Args, table: &str) -> bool {
     false
 }
 
-fn convert_dump(conn: &Connection, dump_file: PathBuf, args: &Args) -> Result<(), Box<dyn Error>> {
+fn convert_dump(conn: &Connection, dump_file: PathBuf, _args: &Args) -> Result<(), Box<dyn Error>> {
     let file = File::open(dump_file)?;
     let reader = BufReader::new(file);
     let mut statement = String::new();
 
     for line in reader.lines() {
         let line = line?;
-        if line.starts_with("--") || line.is_empty() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("--")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with("LOCK TABLES")
+            || trimmed.starts_with("UNLOCK TABLES")
+            || trimmed.starts_with("SET ")
+            || trimmed.starts_with("DELIMITER ")
+        {
             continue;
         }
-        statement.push_str(&line);
-        if line.ends_with(';') {
-            debug!("Executing: {}", statement);
-            conn.execute_batch(&statement)?;
+
+        statement.push_str(trimmed);
+        statement.push('\n');
+        if trimmed.ends_with(';') {
+            let mut exec_stmt = statement.trim().to_string();
+            if exec_stmt.starts_with("CREATE TABLE") {
+                if let Some(pos) = exec_stmt.rfind(')') {
+                    exec_stmt.truncate(pos + 1);
+                    exec_stmt.push(';');
+                }
+            }
+            debug!("Executing: {}", exec_stmt);
+            if let Err(e) = conn.execute_batch(&exec_stmt) {
+                error!("Failed to execute statement: {}", e);
+            }
             statement.clear();
         }
     }
@@ -135,7 +153,7 @@ fn convert_dump(conn: &Connection, dump_file: PathBuf, args: &Args) -> Result<()
 }
 
 fn convert_remote(conn: &Connection, args: &Args) -> Result<(), Box<dyn Error>> {
-    let mut builder = mysql::OptsBuilder::new();
+    let builder = mysql::OptsBuilder::new();
     builder.clone().ip_or_hostname(Some(args.host.as_str()));
     builder.clone().tcp_port(args.port);
     builder.clone().user(Some(args.user.as_str()));
@@ -218,4 +236,3 @@ fn convert_remote(conn: &Connection, args: &Args) -> Result<(), Box<dyn Error>> 
     }
     Ok(())
 }
-
