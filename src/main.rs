@@ -4,7 +4,8 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-
+use fern::Dispatch;
+use log::LevelFilter;
 use mysql::{prelude::*, Pool};
 use rusqlite::{params, Connection};
 
@@ -64,18 +65,40 @@ struct Args {
     quiet: bool,
 }
 
-fn setup_logger(verbose: u8, quiet: bool) {
-    use env_logger::Env;
+
+fn setup_logger(verbose: u8, quiet: bool) -> Result<(), Box<dyn Error>> {
+    // determine base level
     let level = if quiet {
-        "error"
+        LevelFilter::Error
     } else {
         match verbose {
-            0 => "info",
-            1 => "debug",
-            _ => "trace",
+            0 => LevelFilter::Info,
+            1 => LevelFilter::Debug,
+            _ => LevelFilter::Trace,
         }
     };
-    env_logger::Builder::from_env(Env::default().default_filter_or(level)).init();
+
+    Dispatch::new()
+        // 1) format for each log line
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{date} [{level}] {target} - {msg}",
+                date = chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                level = record.level(),
+                target = record.target(),
+                msg = message
+            ))
+        })
+        // 2) set overall level
+        .level(level)
+        // 3) chain to stdout
+        .chain(std::io::stdout())
+        // 4) chain to a log file
+        .chain(fern::log_file("mysql2sqlite.log")?)
+        // 5) apply globally
+        .apply()?;
+
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -121,24 +144,39 @@ fn convert_dump(conn: &Connection, dump_file: PathBuf, _args: &Args) -> Result<(
     for line in reader.lines() {
         let line = line?;
         let trimmed = line.trim_start();
-        if trimmed.starts_with("--")
-            || trimmed.starts_with("/*")
-            || trimmed.starts_with("LOCK TABLES")
-            || trimmed.starts_with("UNLOCK TABLES")
-            || trimmed.starts_with("SET ")
-            || trimmed.starts_with("DELIMITER ")
-            || trimmed.starts_with("START TRANSACTION")
-            || trimmed.starts_with("COMMIT")
-            || trimmed.starts_with("ROLLBACK")
-            || trimmed.starts_with("USE ")
-            || trimmed.starts_with("CREATE DATABASE")
-            || trimmed.starts_with("CREATE SCHEMA")
-            || trimmed.starts_with("DROP DATABASE")
+        if trimmed.is_empty()
+                || trimmed.starts_with("--")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with("LOCK TABLES")
+                || trimmed.starts_with("UNLOCK TABLES")
+                || trimmed.starts_with("SET ")
+                || trimmed.starts_with("DELIMITER ")
+                || trimmed.starts_with("START TRANSACTION")
+                || trimmed.starts_with("COMMIT")
+                || trimmed.starts_with("ROLLBACK")
+                || trimmed.starts_with("USE ")
+                || trimmed.starts_with("CREATE DATABASE")
+                || trimmed.starts_with("CREATE SCHEMA")
+                || trimmed.starts_with("DROP DATABASE")
+                || trimmed.starts_with("/*!")
         {
             continue;
         }
 
-        statement.push_str(trimmed);
+        // strip *inline* comments too (optional but can help)
+        let line = if let Some(idx) = line.find("--") {
+            let before = &line[..idx];
+            // only strip if the “--” isn’t inside a string literal
+            if before.matches('\'').count() % 2 == 0 {
+                before
+            } else {
+                &line
+            }
+        } else {
+            &line
+        };
+
+        statement.push_str(&line);
         statement.push('\n');
         if trimmed.ends_with(';') {
             let mut exec_stmt = statement.trim().to_string();
@@ -147,6 +185,54 @@ fn convert_dump(conn: &Connection, dump_file: PathBuf, _args: &Args) -> Result<(
                     exec_stmt.truncate(pos + 1);
                     exec_stmt.push(';');
                 }
+
+                let mut cleaned = Vec::new();
+                for mut l in exec_stmt.lines().map(|s| s.to_string()) {
+                    let t = l.trim_start();
+                    let upper = t.to_uppercase();
+                    if upper.starts_with("PRIMARY KEY")
+                        || upper.starts_with("UNIQUE KEY")
+                        || upper.starts_with("KEY")
+                        || upper.starts_with("CONSTRAINT")
+                    {
+                        continue;
+                    }
+
+                    if upper.contains("AUTO_INCREMENT") {
+                        let has_comma = l.trim_end().ends_with(',');
+                        l = l.replace("AUTO_INCREMENT", "");
+                        if !upper.contains("PRIMARY KEY") {
+                            l = l.trim_end_matches(',').to_string();
+                            l.push_str(" PRIMARY KEY AUTOINCREMENT");
+                            if has_comma {
+                                l.push(',');
+                            }
+                        } else if !upper.contains("AUTOINCREMENT") {
+                            l = l.trim_end_matches(',').to_string();
+                            l.push_str(" AUTOINCREMENT");
+                            if has_comma {
+                                l.push(',');
+                            }
+                        }
+                    }
+
+                    if upper.contains("UNSIGNED") {
+                        l = l.replace("UNSIGNED", "");
+                    }
+
+                    if let Some(pos) = upper.find("COMMENT") {
+                        let comma = l.trim_end().ends_with(',');
+                        l.truncate(pos);
+                        if comma {
+                            l.push(',');
+                        }
+                    }
+
+                    cleaned.push(l);
+                }
+                exec_stmt = cleaned.join("\n");
+                exec_stmt = exec_stmt.replace(",\n)", "\n)");
+                exec_stmt = exec_stmt.replace(",\n);", "\n);");
             }
 
             if exec_stmt.starts_with("ALTER TABLE") {
@@ -162,9 +248,9 @@ fn convert_dump(conn: &Connection, dump_file: PathBuf, _args: &Args) -> Result<(
                 }
             }
 
-            debug!("Executing: {}", exec_stmt);
+            debug!("About to execute SQL:\n{}", exec_stmt);
             if let Err(e) = conn.execute_batch(&exec_stmt) {
-                error!("Failed to execute statement: {}", e);
+                error!("Error executing SQL: {}\nSQL was:\n{}", e, exec_stmt);
             }
             statement.clear();
         }
