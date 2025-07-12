@@ -127,6 +127,13 @@ fn convert_dump(conn: &Connection, dump_file: PathBuf, _args: &Args) -> Result<(
             || trimmed.starts_with("UNLOCK TABLES")
             || trimmed.starts_with("SET ")
             || trimmed.starts_with("DELIMITER ")
+            || trimmed.starts_with("START TRANSACTION")
+            || trimmed.starts_with("COMMIT")
+            || trimmed.starts_with("ROLLBACK")
+            || trimmed.starts_with("USE ")
+            || trimmed.starts_with("CREATE DATABASE")
+            || trimmed.starts_with("CREATE SCHEMA")
+            || trimmed.starts_with("DROP DATABASE")
         {
             continue;
         }
@@ -141,6 +148,20 @@ fn convert_dump(conn: &Connection, dump_file: PathBuf, _args: &Args) -> Result<(
                     exec_stmt.push(';');
                 }
             }
+
+            if exec_stmt.starts_with("ALTER TABLE") {
+                let lower = exec_stmt.to_lowercase();
+                if lower.contains("add primary key")
+                    || lower.contains("add unique")
+                    || lower.contains("add key")
+                    || lower.contains("add index")
+                {
+                    debug!("Skipping unsupported ALTER statement: {}", exec_stmt);
+                    statement.clear();
+                    continue;
+                }
+            }
+
             debug!("Executing: {}", exec_stmt);
             if let Err(e) = conn.execute_batch(&exec_stmt) {
                 error!("Failed to execute statement: {}", e);
@@ -170,10 +191,10 @@ fn convert_remote(conn: &Connection, args: &Args) -> Result<(), Box<dyn Error>> 
     let tables: Vec<String> = mysql_conn.query("SHOW TABLES")?;
     for table in tables {
         if should_skip_table(args, &table) {
-            info!("Skipping table {}", table);
+            debug!("Skipping table {}", table);
             continue;
         }
-        info!("Processing table {}", table);
+        debug!("Processing table {}", table);
         let desc: Vec<mysql::Row> = mysql_conn.exec(&format!("DESCRIBE `{}`", table), ())?;
         let mut columns = Vec::new();
         let mut placeholders = Vec::new();

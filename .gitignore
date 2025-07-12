@@ -3,3 +3,4 @@
 Cargo.lock
 *.sql
 *.sqlite
+*.sqlite-journal
